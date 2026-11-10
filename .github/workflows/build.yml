@@ -1,1 +1,117 @@
-
+name: build-mod-menu
+on:
+  workflow_dispatch:
+    inputs:
+      apk_release_tag:
+        description: "Release tag that holds brawl.apk"
+        required: true
+        default: "apk"
+      mode:
+        description: "full = menu added | control = same repack WITHOUT the menu (crash test)"
+        type: choice
+        options:
+          - full
+          - control
+        default: full
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build dex
+        run: |
+          set -euo pipefail
+          unzip -q rmenu.zip
+          PLATFORM=$(ls "$ANDROID_HOME/platforms" | sort -V | tail -1)
+          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+          cd rmenu
+          ANDROID_HOME="$ANDROID_HOME" BUILD_TOOLS="$BUILD_TOOLS" PLATFORM="$PLATFORM" bash build.sh
+      - name: Patch and sign APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.apk_release_tag }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          gh release download "$TAG" -p brawl.apk -D work --clobber --repo "$GITHUB_REPOSITORY"
+          curl -fsSL -o work/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          java -jar work/apktool.jar d -f work/brawl.apk -o work/src
+          if [ "$MODE" = "full" ]; then
+          python3 - work/src <<'PY'
+          import glob, os, re, sys
+          import xml.etree.ElementTree as ET
+          SRC = sys.argv[1]
+          CALL = "    invoke-static {p0}, Lcom/ritmada/menu/ModMenu;->attach(Landroid/app/Activity;)V\n"
+          A = "{http://schemas.android.com/apk/res/android}"
+          root = ET.parse(os.path.join(SRC, "AndroidManifest.xml")).getroot()
+          pkg = root.get("package") or ""
+          name = None
+          app = root.find("application")
+          for a in list(app.findall("activity")) + list(app.findall("activity-alias")):
+              for f in a.findall("intent-filter"):
+                  acts = [x.get(A + "name") for x in f.findall("action")]
+                  cats = [x.get(A + "name") for x in f.findall("category")]
+                  if "android.intent.action.MAIN" in acts and "android.intent.category.LAUNCHER" in cats:
+                      name = a.get(A + "targetActivity") or a.get(A + "name")
+                      break
+              if name:
+                  break
+          if not name:
+              sys.exit("No launcher activity found in manifest")
+          print("launcher activity:", name)
+          if name.startswith("."):
+              name = pkg + name
+          elif "." not in name:
+              name = pkg + "." + name
+          rel = name.replace(".", "/") + ".smali"
+          paths = glob.glob(os.path.join(SRC, "smali*", rel))
+          if not paths:
+              sys.exit("Launcher class not found in smali: " + rel)
+          path = paths[0]
+          text = open(path, encoding="utf-8").read()
+          if "ModMenu;->attach" in text:
+              print("already patched"); sys.exit(0)
+          mm = re.search(r"\.method [^\n]*\sonCreate\(Landroid/os/Bundle;\)V\n(.*?)\.end method", text, re.S)
+          if mm:
+              sm = re.search(r"^[ \t]*invoke-super[^\n]*->onCreate\(Landroid/os/Bundle;\)V\n", mm.group(1), re.M)
+              if not sm:
+                  sys.exit("onCreate has no invoke-super line: " + path)
+              pos = mm.start(1) + sm.end()
+              text = text[:pos] + CALL + text[pos:]
+          else:
+              sup = re.search(r"^\.super L([^;]+);", text, re.M).group(1)
+              text += ("\n.method protected onCreate(Landroid/os/Bundle;)V\n    .locals 0\n"
+                       "    invoke-super {p0, p1}, L" + sup + ";->onCreate(Landroid/os/Bundle;)V\n"
+                       + CALL + "    return-void\n.end method\n")
+          open(path, "w", encoding="utf-8").write(text)
+          print("patched", path)
+          PY
+          fi
+          java -jar work/apktool.jar b work/src -o work/rebuilt.apk
+          if [ "$MODE" = "full" ]; then
+          python3 - work/rebuilt.apk rmenu/out/dex/classes.dex <<'PY'
+          import re, sys, zipfile
+          apk, dex = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(apk) as z:
+              nums = [int(m.group(1) or 1) for n in z.namelist() if (m := re.fullmatch(r"classes(\d*)\.dex", n))]
+          nxt = max(nums) + 1
+          with zipfile.ZipFile(apk, "a", zipfile.ZIP_DEFLATED) as z:
+              z.write(dex, "classes%d.dex" % nxt)
+          print("added classes%d.dex" % nxt)
+          PY
+          fi
+          T="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
+          "$T/zipalign" -p -f 4 work/rebuilt.apk work/aligned.apk
+          keytool -genkeypair -keystore work/my.jks -alias k -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=mod"
+          "$T/apksigner" sign --ks work/my.jks --ks-pass pass:android --key-pass pass:android --out work/result.apk work/aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.mode == 'full' && 'BrawlMod-apk' || 'BrawlControl-apk' }}
+          path: work/result.apk
+          compression-level: 0
